@@ -11,8 +11,8 @@ pre-configured settings. It handles:
 - Both solo (single node) and cluster deployments
 
 Usage:
-    ./run-recipe.py recipes/glm-4.7-nvfp4.yaml
-    ./run-recipe.py glm-4.7-nvfp4 --port 9000 --solo
+    ./run-recipe.py recipes/deepseek-v4-flash-0731.yaml
+    ./run-recipe.py glm-4.7-flash-awq --port 9000 --solo
     ./run-recipe.py minimax-m2-awq --setup  # Full setup: build + download + run
     ./run-recipe.py --list
 
@@ -674,32 +674,35 @@ def main():
         epilog="""
 Examples:
   # Basic usage
-  %(prog)s glm-4.7-nvfp4
-  %(prog)s glm-4.7-nvfp4 --port 9000 --solo
+  %(prog)s glm-4.7-flash-awq --solo
+  %(prog)s glm-4.7-flash-awq --port 9000 --solo
 
   # Full setup (build container + download model + run)
-  %(prog)s glm-4.7-nvfp4 --setup
+  %(prog)s glm-4.7-flash-awq --solo --setup
 
-  # Cluster deployment (manual)
-  %(prog)s glm-4.7-nvfp4 -n 192.168.1.1,192.168.1.2 --setup
-
-  # Cluster deployment (auto-discover)
+  # Cluster deployment (default: auto-discover once, then reuse .env)
   %(prog)s --discover              # Detect nodes and save to .env
-  %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+  %(prog)s minimax-m2-awq --setup  # Uses nodes from .env
+
+  # Manual fallback only when autodiscovery cannot support the topology
+  %(prog)s minimax-m2-awq -n HEAD_IP,WORKER_IP --setup
 
   # Just build/download without running
-  %(prog)s glm-4.7-nvfp4 --build-only
-  %(prog)s glm-4.7-nvfp4 --download-only
+  %(prog)s glm-4.7-flash-awq --solo --build-only
+  %(prog)s glm-4.7-flash-awq --solo --download-only
 
   # Pass extra arguments to vLLM (after --)
-  %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
-  %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
+  %(prog)s glm-4.7-flash-awq --solo -- --load-format safetensors
+  %(prog)s glm-4.7-flash-awq --solo -- --served-model-name my-api
 
   # Apply additional launch-cluster mods
-  %(prog)s glm-4.7-nvfp4 --apply-mod mods/use-official-vllm
+  %(prog)s glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
 
   # Publish ports in solo mode
-  %(prog)s glm-4.7-nvfp4 --solo -p 8000:8000
+  %(prog)s glm-4.7-flash-awq --solo -p 8000:8000
+
+  # Map host directories into the container
+  %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
 
   # List available recipes
   %(prog)s --list
@@ -783,7 +786,9 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
-        "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
+        "-n",
+        "--nodes",
+        help="Manual fallback/override: comma-separated node IPs (first is head node)",
     )
     launch_group.add_argument(
         "-d", "--daemon", action="store_true", help="Run in daemon mode"
@@ -824,6 +829,15 @@ Examples:
         default=[],
         metavar="HOST:CONTAINER",
         help="Publish a container port in solo mode, e.g. -p 8000:8000. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-v",
+        "--volume",
+        action="append",
+        dest="volume_mappings",
+        default=[],
+        metavar="LOCAL:CONTAINER",
+        help="Map a volume using Docker syntax, e.g. -v /local/path:/container/path. Can be used multiple times.",
     )
     backend_group = launch_group.add_mutually_exclusive_group()
     backend_group.add_argument(
@@ -878,6 +892,18 @@ Examples:
         action="store_true",
         dest="keep_entrypoint",
         help="Keep the Docker image entrypoint instead of clearing it before launch",
+    )
+    launch_group.add_argument(
+        "--earlyoom",
+        action="store_true",
+        dest="earlyoom",
+        help="Run earlyoom as the container foreground process instead of sleep infinity",
+    )
+    launch_group.add_argument(
+        "--earlyoom-args",
+        dest="earlyoom_args",
+        metavar="ARGS",
+        help="Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')",
     )
     launch_group.add_argument(
         "--non-privileged",
@@ -1059,11 +1085,11 @@ Examples:
         print(f"This model is too large to run on a single node.")
         print()
         print("Options:")
-        print(
-            f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2"
-        )
-        print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
+        print(f"  1. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        print(
+            "  2. If autodiscovery cannot support the topology, specify nodes as instructed."
+        )
         return 1
     if solo_only and not is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires solo mode.")
@@ -1079,6 +1105,11 @@ Examples:
             "Error: -p/--publish port forwarding is only supported in solo mode."
         )
         print("Use --solo or remove port mappings for cluster mode.")
+        return 1
+
+    if (args.earlyoom or args.earlyoom_args) and args.keep_entrypoint:
+        print("Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint.")
+        print("Remove --keep-entrypoint so earlyoom can run as the foreground process.")
         return 1
 
     # Determine copy targets for build/model distribution.
@@ -1299,6 +1330,8 @@ Examples:
             cmd_parts.extend(["-e", env_var])
         for port_mapping in args.port_mappings:
             cmd_parts.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd_parts.extend(["-v", volume_mapping])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         if args.container_name:
@@ -1313,6 +1346,10 @@ Examples:
             cmd_parts.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd_parts.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd_parts.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd_parts.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd_parts.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1383,6 +1420,8 @@ Examples:
 
         for port_mapping in args.port_mappings:
             cmd.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd.extend(["-v", volume_mapping])
 
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])
@@ -1398,6 +1437,10 @@ Examples:
             cmd.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd.append("--non-privileged")
         if args.mem_limit_gb:
